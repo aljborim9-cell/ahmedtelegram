@@ -12,6 +12,19 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 ENV_FILE = BASE_DIR / ".env"
 DB_FILE = DATA_DIR / "database.json"
+LOG_FILE = DATA_DIR / "operations.log"
+
+# Setup Centralized Logging
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("A2TV")
 
 def load_env(env_path=ENV_FILE):
     """Simple and robust parser for .env file without external dependencies."""
@@ -42,8 +55,16 @@ except ValueError:
 
 # Server Settings
 API_HOST = os.getenv("API_HOST", "0.0.0.0").strip()
-API_PORT = int(os.getenv("API_PORT", "8080"))
+API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8080")))
 SECRET_KEY = os.getenv("SECRET_KEY", "goldentv-secret-key-2026").strip()
+
+# Public URL resolution (Railway domain or static public host)
+PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN")
+if PUBLIC_URL:
+    if not PUBLIC_URL.startswith("http"):
+        PUBLIC_URL = f"https://{PUBLIC_URL}"
+else:
+    PUBLIC_URL = f"http://{API_HOST}:{API_PORT}"
 
 # App Version Reference (com.A2)
 APP_PACKAGE = "com.A2"

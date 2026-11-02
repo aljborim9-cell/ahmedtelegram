@@ -10,9 +10,9 @@ import time
 import threading
 from datetime import datetime
 from urllib.request import Request, urlopen
-from config import DB_FILE, ADMIN_ID
+from config import DB_FILE, ADMIN_ID, logger
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 # Initial defaults are empty as channels and categories are loaded exclusively from the Bot
 DEFAULT_CATEGORIES = []
@@ -77,40 +77,278 @@ class Database:
         os.replace(temp_file, self.db_path)
 
     # ------------------ Categories ------------------
-    def get_categories(self):
-        with _lock:
-            data = self._load_raw()
-            return data.get("categories", [])
+    QUAL_RANKS = {
+        "4K": 5, "2160P": 5, "UHD": 5,
+        "FHD": 4, "1080P": 4,
+        "HD": 3, "720P": 3,
+        "SD": 2, "480P": 2,
+        "LOW": 1, "360P": 1
+    }
 
-    def add_category(self, cat_id, name, icon="📺"):
-        with _lock:
-            data = self._load_raw()
-            cats = data.setdefault("categories", [])
-            for c in cats:
-                if c["id"] == cat_id:
-                    c["name"] = name
-                    c["icon"] = icon
-                    self._save_raw(data)
-                    return c
-            new_cat = {"id": cat_id, "name": name, "icon": icon}
-            cats.append(new_cat)
-            self._save_raw(data)
-            return new_cat
+    def _normalize_name_and_quality(self, raw_name, default_quality="HD"):
+        """
+        Extracts base channel name and quality string from channel title.
+        e.g.:
+        'beIN SPORTS 1 FHD' -> ('beIN SPORTS 1', 'FHD')
+        'beIN SPORTS 1 [1080p]' -> ('beIN SPORTS 1', 'FHD')
+        'SSC 1 - HD' -> ('SSC 1', 'HD')
+        'الكأس 1 SD' -> ('الكأس 1', 'SD')
+        'beIN Sports 2 4K' -> ('beIN Sports 2', '4K')
+        """
+        if not raw_name:
+            return "قناة بث مباشر", default_quality or "HD"
 
-    def delete_category(self, cat_id):
+        cleaned = str(raw_name).strip()
+        pattern = r'[\s\-_\[\(\{\|]+(?:FHD|1080p?|HD|720p?|SD|480p?|360p?|4K|2160p?|UHD|LOW|HEVC|H\.?265)[\s\-_\]\)\}\|]*$'
+        m = re.search(pattern, cleaned, re.IGNORECASE)
+        quality = default_quality or "HD"
+        if m:
+            matched_str = m.group(0).upper()
+            base = cleaned[:m.start()].strip()
+            if any(q in matched_str for q in ["4K", "2160", "UHD"]): quality = "4K"
+            elif any(q in matched_str for q in ["FHD", "1080"]): quality = "FHD"
+            elif any(q in matched_str for q in ["HD", "720"]): quality = "HD"
+            elif any(q in matched_str for q in ["SD", "480"]): quality = "SD"
+            elif any(q in matched_str for q in ["LOW", "360"]): quality = "LOW"
+            return (base if base else cleaned), quality
+
+        upper = cleaned.upper()
+        if " 4K" in upper or "[4K]" in upper: quality = "4K"
+        elif " FHD" in upper or "[FHD]" in upper or "1080P" in upper: quality = "FHD"
+        elif " HD" in upper or "[HD]" in upper or "720P" in upper: quality = "HD"
+        elif " SD" in upper or "[SD]" in upper or "480P" in upper: quality = "SD"
+        elif " LOW" in upper or "[LOW]" in upper: quality = "LOW"
+
+        return cleaned, quality
+
+    def get_categories(self, api_id=None):
         with _lock:
             data = self._load_raw()
             cats = data.get("categories", [])
-            data["categories"] = [c for c in cats if c["id"] != cat_id]
+            if api_id and api_id != "all":
+                return [c for c in cats if c.get("api_id") == api_id]
+            return cats
+
+    def get_categories_for_api(self, api_id):
+        with _lock:
+            data = self._load_raw()
+            channels = data.get("channels", [])
+            categories = data.get("categories", [])
+            result = []
+            for c in categories:
+                # Count channels in this category that belong to this API or in general
+                ch_count = len([ch for ch in channels if ch.get("category") == c["id"] and (not api_id or ch.get("api_id") == api_id or c.get("api_id") == api_id)])
+                if c.get("api_id") == api_id or (api_id and ch_count > 0) or (not api_id):
+                    result.append({
+                        "id": c["id"],
+                        "name": c["name"],
+                        "icon": c.get("icon", "📁"),
+                        "count": ch_count,
+                        "api_id": c.get("api_id", api_id or "general")
+                    })
+            return result
+
+    def get_category(self, cat_id):
+        with _lock:
+            data = self._load_raw()
+            for c in data.get("categories", []):
+                if c.get("id") == cat_id:
+                    return c
+            return None
+
+    def add_category(self, cat_id, name, icon="📁", image=None, api_id=None):
+        with _lock:
+            data = self._load_raw()
+            cats = data.setdefault("categories", [])
+            clean_id = str(cat_id).strip().lower().replace(" ", "_")
+            clean_name = str(name).strip()
+            clean_icon = str(icon).strip() if icon else "📁"
+            clean_image = str(image).strip() if image else ""
+            clean_api = str(api_id).strip() if api_id else "general"
+            for c in cats:
+                if c["id"] == clean_id:
+                    c["name"] = clean_name
+                    c["icon"] = clean_icon
+                    if clean_image: c["image"] = clean_image
+                    if api_id: c["api_id"] = clean_api
+                    self._save_raw(data)
+                    logger.info("Category updated in DB: %s", c)
+                    return True, c
+
+            new_cat = {
+                "id": clean_id,
+                "name": clean_name,
+                "icon": clean_icon,
+                "image": clean_image,
+                "api_id": clean_api,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }
+            cats.append(new_cat)
             self._save_raw(data)
-            return True
+
+            # Verification
+            verified = any(c["id"] == clean_id for c in self._load_raw().get("categories", []))
+            if verified:
+                logger.info("Category added to DB: %s", new_cat)
+                return True, new_cat
+            logger.error("Category persistence verification failed: %s", clean_id)
+            return False, "فشل حفظ القسم في قاعدة البيانات"
+
+    def update_category(self, cat_id, new_name=None, new_icon=None, new_image=None, api_id=None):
+        with _lock:
+            data = self._load_raw()
+            cats = data.setdefault("categories", [])
+            target = None
+            for c in cats:
+                if c["id"] == cat_id:
+                    target = c
+                    break
+            if not target:
+                return False, "القسم المطلوب غير موجود"
+
+            if new_name is not None and str(new_name).strip():
+                target["name"] = str(new_name).strip()
+                for ch in data.get("channels", []):
+                    if ch.get("category") == cat_id:
+                        ch["categoryName"] = target["name"]
+
+            if new_icon is not None and str(new_icon).strip():
+                target["icon"] = str(new_icon).strip()
+
+            if new_image is not None:
+                target["image"] = str(new_image).strip()
+
+            if api_id is not None:
+                if str(api_id).strip() in ["", "none", "direct"]:
+                    target.pop("api_id", None)
+                else:
+                    target["api_id"] = str(api_id).strip()
+
+            self._save_raw(data)
+
+            verified = any(c["id"] == cat_id for c in self._load_raw().get("categories", []))
+            if verified:
+                logger.info("Category updated in DB: %s", target)
+                return True, target
+            return False, "فشل حفظ تعديل القسم"
+
+    def delete_category(self, cat_id, delete_channels=False, move_to_cat_id=None):
+        with _lock:
+            data = self._load_raw()
+            cats = data.get("categories", [])
+            initial_len = len(cats)
+            data["categories"] = [c for c in cats if c["id"] != cat_id]
+
+            channels = data.get("channels", [])
+            if delete_channels:
+                data["channels"] = [ch for ch in channels if ch.get("category") != cat_id]
+            elif move_to_cat_id:
+                dest_cat = next((c for c in data.get("categories", []) if c["id"] == move_to_cat_id), None)
+                dest_name = dest_cat.get("name", "عام") if dest_cat else "عام"
+                for ch in channels:
+                    if ch.get("category") == cat_id:
+                        ch["category"] = move_to_cat_id
+                        ch["categoryName"] = dest_name
+            else:
+                for ch in channels:
+                    if ch.get("category") == cat_id:
+                        ch["category"] = "general"
+                        ch["categoryName"] = "عام"
+
+            self._save_raw(data)
+
+            verified = len(self._load_raw().get("categories", [])) < initial_len
+            if verified:
+                logger.info("Category deleted from DB: %s (delete_channels=%s, move_to=%s)", cat_id, delete_channels, move_to_cat_id)
+                return True, cat_id
+            return False, "القسم غير موجود أو تعذر حذفه"
+
+    def search_categories(self, query):
+        if not query or not str(query).strip():
+            return self.get_categories()
+        norm_q = self._normalize_arabic(query)
+        with _lock:
+            data = self._load_raw()
+            results = []
+            for c in data.get("categories", []):
+                c_name = self._normalize_arabic(c.get("name", ""))
+                c_id = c.get("id", "").lower()
+                if norm_q in c_name or norm_q in c_id:
+                    results.append(c)
+            return results
 
     def clear_categories(self):
         with _lock:
             data = self._load_raw()
             data["categories"] = []
             self._save_raw(data)
+            logger.info("All categories cleared from DB")
             return True
+
+    def reorder_category(self, cat_id, direction="up"):
+        with _lock:
+            data = self._load_raw()
+            cats = data.get("categories", [])
+            idx = next((i for i, c in enumerate(cats) if c.get("id") == cat_id), -1)
+            if idx == -1:
+                return False, "القسم غير موجود"
+            if direction == "up" and idx > 0:
+                cats[idx], cats[idx - 1] = cats[idx - 1], cats[idx]
+            elif direction == "down" and idx < len(cats) - 1:
+                cats[idx], cats[idx + 1] = cats[idx + 1], cats[idx]
+            else:
+                return False, "القسم بالفعل في نهاية الترتيب"
+            data["categories"] = cats
+            self._save_raw(data)
+            return True, "تم تغيير ترتيب القسم بنجاح"
+
+    def toggle_category_hidden(self, cat_id):
+        with _lock:
+            data = self._load_raw()
+            cats = data.get("categories", [])
+            target = None
+            for c in cats:
+                if c.get("id") == cat_id:
+                    new_val = not c.get("hidden", False)
+                    c["hidden"] = new_val
+                    target = c
+                    break
+            if not target:
+                return False, "القسم غير موجود"
+            self._save_raw(data)
+            return True, target.get("hidden", False)
+
+    def clear_category_channels(self, cat_id):
+        with _lock:
+            data = self._load_raw()
+            channels = data.get("channels", [])
+            initial_count = len(channels)
+            data["channels"] = [c for c in channels if c.get("category") != cat_id]
+            removed = initial_count - len(data["channels"])
+            self._save_raw(data)
+            logger.info("Cleared %d channels from category %s", removed, cat_id)
+            return removed
+
+    def move_category_channels(self, from_cat_id, to_cat_id, to_cat_name=None):
+        with _lock:
+            data = self._load_raw()
+            channels = data.get("channels", [])
+            if not to_cat_name:
+                for c in data.get("categories", []):
+                    if c.get("id") == to_cat_id:
+                        to_cat_name = c.get("name", to_cat_id)
+                        break
+            to_cat_name = to_cat_name or to_cat_id
+            count = 0
+            for ch in channels:
+                if ch.get("category") == from_cat_id:
+                    ch["category"] = to_cat_id
+                    ch["categoryName"] = to_cat_name
+                    count += 1
+            self._save_raw(data)
+            logger.info("Moved %d channels from %s to %s", count, from_cat_id, to_cat_id)
+            return count
+
 
     # ------------------ Channels ------------------
     def get_channels(self, category=None):
@@ -144,7 +382,7 @@ class Database:
             self._save_raw(data)
             return ch_dict
 
-    def add_single_channel(self, name, url, category_id="general", category_name=None, logo="📺", quality="FHD", referer="", useragent="", origin="", cookie="", key="", scheme=""):
+    def add_single_channel(self, name, url, category_id="general", category_name=None, logo="📺", quality="FHD", referer="", useragent="", origin="", cookie="", key="", scheme="", api_id="direct"):
         with _lock:
             data = self._load_raw()
             categories = data.setdefault("categories", [])
@@ -156,7 +394,7 @@ class Database:
                 if not category_name:
                     category_name = "قنوات رياضية" if "sport" in cat_id_clean.lower() or "رياض" in cat_id_clean else (cat_id_clean if cat_id_clean != "general" else "منوعات عامة")
                 icon = "⚽" if "رياض" in str(category_name) or "sport" in str(category_name).lower() else "📺"
-                cat_match = {"id": cat_id_clean.lower().replace(" ", "_"), "name": str(category_name), "icon": icon}
+                cat_match = {"id": cat_id_clean.lower().replace(" ", "_"), "name": str(category_name), "icon": icon, "api_id": str(api_id or "general")}
                 categories.append(cat_match)
             cat_id = cat_match["id"]
             cat_name = cat_match["name"]
@@ -181,15 +419,54 @@ class Database:
             elif ".m3u8" in lower_url or ".php" in lower_url or ".js" in lower_url:
                 stream_type = "hls"
 
+            base_name, detected_quality = self._normalize_name_and_quality(name, quality)
+            effective_quality = quality if quality and quality != "HD" else detected_quality
+
+            server_obj = {
+                "name": f"جودة ({effective_quality})",
+                "quality": effective_quality,
+                "url": clean_url,
+                "type": stream_type,
+                "referer": str(referer).strip() if referer else "",
+                "useragent": str(useragent).strip() if useragent else ""
+            }
+
+            # Check if channel with this base_name already exists in this category
+            existing_ch = None
+            for c in channels:
+                if c.get("category") == cat_id and (c.get("name", "").strip().lower() == base_name.lower() or c.get("url") == clean_url):
+                    existing_ch = c
+                    break
+
+            if existing_ch:
+                servers = existing_ch.setdefault("servers", [])
+                if not any(s.get("url") == clean_url for s in servers):
+                    servers.append(server_obj)
+
+                # If this quality is higher, set as primary
+                curr_rank = self.QUAL_RANKS.get(existing_ch.get("quality", "HD").upper(), 3)
+                new_rank = self.QUAL_RANKS.get(effective_quality.upper(), 3)
+                if new_rank >= curr_rank:
+                    existing_ch["quality"] = effective_quality
+                    existing_ch["url"] = clean_url
+                    existing_ch["streamUrl"] = clean_url
+                    if referer: existing_ch["referer"] = referer
+                    if useragent: existing_ch["useragent"] = useragent
+
+                self._save_raw(data)
+                logger.info("Channel merged into existing entry: %s with quality %s (total qualities: %s)", base_name, effective_quality, len(servers))
+                return existing_ch
+
             ch_id = f"ch-{int(time.time())}-{len(channels)}"
             new_ch = {
                 "id": ch_id,
-                "name": str(name).strip(),
+                "name": base_name,
                 "category": cat_id,
                 "categoryName": cat_name,
+                "api_id": str(api_id or "direct"),
                 "currentShow": "بث مباشر حصري عبر الإنترنت",
                 "logo": str(logo).strip() if logo else "📺",
-                "quality": str(quality).strip() if quality else "FHD",
+                "quality": effective_quality,
                 "url": clean_url,
                 "streamUrl": clean_url,
                 "referer": str(referer).strip() if referer else "",
@@ -199,57 +476,349 @@ class Database:
                 "key": str(key).strip() if key else "",
                 "scheme": str(scheme).strip() if scheme else "",
                 "badge": "مباشر",
-                "servers": [
-                    {"name": f"سيرفر البث ({quality or 'FHD'})", "url": clean_url, "type": stream_type}
-                ]
+                "servers": [server_obj]
             }
-
-            for idx, c in enumerate(channels):
-                if c.get("url") == clean_url or (c.get("name") == new_ch["name"] and c.get("category") == cat_id):
-                    new_ch["id"] = c.get("id", ch_id)
-                    channels[idx] = new_ch
-                    self._save_raw(data)
-                    return new_ch
 
             channels.insert(0, new_ch)
             self._save_raw(data)
+            logger.info("Channel created in DB: %s with quality %s", base_name, effective_quality)
             return new_ch
 
     def update_channel(self, channel_id, ch_dict):
         with _lock:
             data = self._load_raw()
             channels = data.get("channels", [])
+            target = None
             for i, c in enumerate(channels):
                 if c["id"] == channel_id:
-                    ch_dict["id"] = channel_id
-                    channels[i] = ch_dict
-                    self._save_raw(data)
-                    return ch_dict
-            return None
+                    for k, v in ch_dict.items():
+                        c[k] = v
+                    c["id"] = channel_id
+                    target = c
+                    break
+            if not target:
+                return False, "القناة غير موجودة"
+
+            self._save_raw(data)
+
+            # Verification
+            saved_ch = self.get_channel(channel_id)
+            if saved_ch:
+                logger.info("Channel updated in DB: %s (name: %s)", channel_id, saved_ch.get("name"))
+                return True, saved_ch
+            logger.error("Channel update verification failed: %s", channel_id)
+            return False, "فشل حفظ تعديل القناة في قاعدة البيانات"
 
     def delete_channel(self, channel_id):
         with _lock:
             data = self._load_raw()
             channels = data.get("channels", [])
             initial_len = len(channels)
+            ch_name = next((c.get("name", channel_id) for c in channels if c["id"] == channel_id), channel_id)
             data["channels"] = [c for c in channels if c["id"] != channel_id]
             self._save_raw(data)
-            return len(data["channels"]) < initial_len
+
+            # Verification
+            verified = len(self._load_raw().get("channels", [])) < initial_len
+            if verified:
+                logger.info("Channel deleted from DB: %s (%s)", channel_id, ch_name)
+                return True, ch_name
+            return False, "القناة غير موجودة أو تعذر حذفها"
+
+    def move_channel_to_category(self, channel_id, new_category_id):
+        with _lock:
+            data = self._load_raw()
+            cats = data.get("categories", [])
+            target_cat = next((c for c in cats if c["id"] == new_category_id), None)
+            if not target_cat:
+                return False, "القسم الهدف غير موجود"
+            cat_name = target_cat.get("name", new_category_id)
+
+            for ch in data.get("channels", []):
+                if ch["id"] == channel_id:
+                    ch["category"] = new_category_id
+                    ch["categoryName"] = cat_name
+                    self._save_raw(data)
+                    logger.info("Channel %s moved to category %s", channel_id, new_category_id)
+                    return True, ch
+            return False, "القناة غير موجودة"
+
+    def get_channels_by_category(self, category_id):
+        return self.get_channels(category_id)
 
     def delete_all_channels(self):
         with _lock:
             data = self._load_raw()
             count = len(data.get("channels", []))
             data["channels"] = []
-            data["categories"] = []
             self._save_raw(data)
+            logger.info("All channels cleared from DB: %s removed", count)
             return count
+
+    @staticmethod
+    def _normalize_arabic(text):
+        if not text:
+            return ""
+        text = str(text).lower()
+        text = re.sub(r'[إأآا]', 'ا', text)
+        text = re.sub(r'ة', 'ه', text)
+        text = re.sub(r'[ىي]', 'ي', text)
+        text = re.sub(r'[ًٌٍَُِّْـ]', '', text)
+        return text.strip()
+
+    def search_channels(self, query, category=None):
+        if not query or not str(query).strip():
+            return self.get_channels(category)
+        norm_q = self._normalize_arabic(query)
+        with _lock:
+            data = self._load_raw()
+            channels = data.get("channels", [])
+            if category and category != "all":
+                channels = [c for c in channels if c.get("category") == category]
+            results = []
+            for ch in channels:
+                name = self._normalize_arabic(ch.get("name", ""))
+                cat_name = self._normalize_arabic(ch.get("categoryName", ""))
+                url = ch.get("url", "").lower()
+                qual = ch.get("quality", "").lower()
+                matched = (norm_q in name) or (norm_q in cat_name) or (norm_q in url) or (norm_q in qual)
+                if not matched:
+                    for srv in ch.get("servers", []):
+                        s_name = self._normalize_arabic(srv.get("name", ""))
+                        s_url = srv.get("url", "").lower()
+                        if norm_q in s_name or norm_q in s_url:
+                            matched = True
+                            break
+                if matched:
+                    results.append(ch)
+            return results
+
+    def toggle_channel_disabled(self, channel_id):
+        with _lock:
+            data = self._load_raw()
+            for ch in data.get("channels", []):
+                if ch.get("id") == channel_id:
+                    new_val = not ch.get("disabled", False)
+                    ch["disabled"] = new_val
+                    self._save_raw(data)
+                    logger.info("Channel %s toggled disabled=%s", channel_id, new_val)
+                    return True, new_val
+            return False, "القناة غير موجودة"
+
+    def add_channel_server(self, channel_id, quality, url, name=None, referer="", useragent=""):
+        with _lock:
+            data = self._load_raw()
+            for ch in data.get("channels", []):
+                if ch.get("id") == channel_id:
+                    servers = ch.setdefault("servers", [])
+                    srv_name = name or f"جودة ({quality})"
+                    existing = next((s for s in servers if s.get("quality", "").upper() == quality.upper()), None)
+                    if not referer or not useragent:
+                        lower_u = str(url).lower()
+                        if any(k in lower_u for k in ["maziika", "sa037", "sa047", "ostora", "uruk", "optikl"]):
+                            if not referer: referer = "https://www.w2.maziikaaaaa.shop/"
+                            if not useragent: useragent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+
+                    if existing:
+                        existing["url"] = url
+                        existing["name"] = srv_name
+                        if referer: existing["referer"] = referer
+                        if useragent: existing["useragent"] = useragent
+                    else:
+                        stype = "hls" if (".m3u8" in url or "m3u8" in url) else ("ts" if ".ts" in url else "mp4")
+                        servers.append({
+                            "name": srv_name,
+                            "quality": quality,
+                            "url": url,
+                            "type": stype,
+                            "referer": referer,
+                            "useragent": useragent
+                        })
+                    self._save_raw(data)
+                    logger.info("Server/quality added to channel %s: %s", channel_id, quality)
+                    return True, ch
+            return False, "القناة غير موجودة"
+
+    def delete_channel_server(self, channel_id, server_idx):
+        with _lock:
+            data = self._load_raw()
+            for ch in data.get("channels", []):
+                if ch.get("id") == channel_id:
+                    servers = ch.get("servers", [])
+                    if 0 <= server_idx < len(servers):
+                        removed = servers.pop(server_idx)
+                        if servers:
+                            ch["url"] = servers[0].get("url", ch.get("url"))
+                            ch["quality"] = servers[0].get("quality", ch.get("quality"))
+                        self._save_raw(data)
+                        logger.info("Server removed from channel %s: %s", channel_id, removed)
+                        return True, removed
+                    return False, "رقم السيرفر غير صحيح"
+            return False, "القناة غير موجودة"
+
+    def update_channel_logo(self, channel_id, logo):
+        return self.update_channel(channel_id, {"logo": logo})
+
+    def update_channel_headers(self, channel_id, referer=None, useragent=None, origin=None, cookie=None, key=None):
+        patch = {}
+        if referer is not None: patch["referer"] = referer
+        if useragent is not None: patch["useragent"] = useragent
+        if origin is not None: patch["origin"] = origin
+        if cookie is not None: patch["cookie"] = cookie
+        if key is not None: patch["key"] = key
+        return self.update_channel(channel_id, patch)
+
+    def test_stream_url(self, url, referer="", useragent="", timeout=6):
+        try:
+            req_headers = {
+                "User-Agent": useragent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            if referer:
+                req_headers["Referer"] = referer
+            req = Request(url, headers=req_headers)
+            t0 = time.time()
+            with urlopen(req, timeout=timeout) as resp:
+                elapsed_ms = int((time.time() - t0) * 1000)
+                code = resp.getcode()
+                ctype = resp.headers.get("Content-Type", "unknown")
+                return {
+                    "ok": True,
+                    "code": code,
+                    "latency": elapsed_ms,
+                    "content_type": ctype,
+                    "message": f"🟢 الرابط يعمل بكفاءة ({code} OK | {elapsed_ms}ms)"
+                }
+        except Exception as e:
+            return {
+                "ok": False,
+                "code": 0,
+                "error": str(e),
+                "message": f"🔴 تعذر الاتصال أو الرابط لا يعمل: {e}"
+            }
+
+    def export_channels_m3u(self, category=None):
+        channels = self.get_channels(category)
+        lines = ["#EXTM3U"]
+        for ch in channels:
+            cid = ch.get("id", "")
+            name = ch.get("name", "Channel")
+            cat_name = ch.get("categoryName", "عام")
+            logo = ch.get("logo", "")
+            logo_attr = f' tvg-logo="{logo}"' if logo and logo.startswith("http") else ""
+            url = ch.get("url", "")
+            ref = ch.get("referer", "")
+            ua = ch.get("useragent", "")
+            qual = ch.get("quality", "")
+            title = f"{name} [{qual}]" if qual else name
+
+            lines.append(f'#EXTINF:-1 tvg-id="{cid}" tvg-name="{name}"{logo_attr} group-title="{cat_name}",{title}')
+            if ua:
+                lines.append(f'#EXTVLCOPT:http-user-agent={ua}')
+            if ref:
+                lines.append(f'#EXTVLCOPT:http-referrer={ref}')
+            lines.append(url)
+        return "\n".join(lines)
+
+    def export_database_json(self):
+        with _lock:
+            data = self._load_raw()
+            return json.dumps(data, ensure_ascii=False, indent=2)
+
+    def import_database_json(self, json_content_or_dict, merge=True):
+        with _lock:
+            try:
+                if isinstance(json_content_or_dict, (bytes, bytearray)):
+                    json_content_or_dict = json_content_or_dict.decode('utf-8')
+                if isinstance(json_content_or_dict, str):
+                    imported = json.loads(json_content_or_dict)
+                else:
+                    imported = json_content_or_dict
+            except Exception as e:
+                return False, f"تنسيق JSON غير صالح: {e}"
+
+            if not isinstance(imported, dict):
+                return False, "تنسيق البيانات غير صحيح، يجب أن يكون كائن JSON رئيسي"
+
+            if not merge:
+                self._save_raw(imported)
+                return True, "تم استبدال قاعدة البيانات بالكامل بنجاح"
+
+            data = self._load_raw()
+            existing_cat_ids = {c["id"]: c for c in data.get("categories", [])}
+            for c in imported.get("categories", []):
+                if c.get("id") in existing_cat_ids:
+                    existing_cat_ids[c["id"]].update(c)
+                else:
+                    data.setdefault("categories", []).append(c)
+
+            existing_ch_ids = {ch["id"]: ch for ch in data.get("channels", [])}
+            added_ch = 0
+            for ch in imported.get("channels", []):
+                if ch.get("id") in existing_ch_ids:
+                    existing_ch_ids[ch["id"]].update(ch)
+                else:
+                    data.setdefault("channels", []).append(ch)
+                    added_ch += 1
+
+            existing_api_ids = {a["id"]: a for a in data.get("channel_apis", [])}
+            for a in imported.get("channel_apis", []):
+                if a.get("id") in existing_api_ids:
+                    existing_api_ids[a["id"]].update(a)
+                else:
+                    data.setdefault("channel_apis", []).append(a)
+
+            self._save_raw(data)
+            return True, f"تم دمج البيانات بنجاح (إضافة {added_ch} قناة جديدة)"
+
+    def get_channel_stats(self):
+        with _lock:
+            data = self._load_raw()
+            cats = data.get("categories", [])
+            channels = data.get("channels", [])
+            apis = data.get("channel_apis", [])
+
+            active_cnt = sum(1 for c in channels if not c.get("disabled", False))
+            disabled_cnt = len(channels) - active_cnt
+
+            by_cat = {}
+            for c in cats:
+                by_cat[c.get("name", c["id"])] = 0
+            for ch in channels:
+                cname = ch.get("categoryName", "عام")
+                by_cat[cname] = by_cat.get(cname, 0) + 1
+
+            by_qual = {}
+            for ch in channels:
+                q = ch.get("quality", "FHD").upper()
+                by_qual[q] = by_qual.get(q, 0) + 1
+
+            multi_server_count = sum(1 for ch in channels if len(ch.get("servers", [])) > 1)
+
+            return {
+                "total_categories": len(cats),
+                "total_channels": len(channels),
+                "active_channels": active_cnt,
+                "disabled_channels": disabled_cnt,
+                "multi_quality_channels": multi_server_count,
+                "total_apis": len(apis),
+                "by_category": by_cat,
+                "by_quality": by_qual
+            }
+
 
     # ------------------ Channel APIs (PHP JSON & M3U) ------------------
     def get_channel_apis(self):
         with _lock:
             data = self._load_raw()
             return data.get("channel_apis", [])
+
+    def get_channel_api(self, api_id):
+        with _lock:
+            data = self._load_raw()
+            for a in data.get("channel_apis", []):
+                if a.get("id") == api_id:
+                    return a
+            return None
 
     def add_channel_api(self, name, url, api_type="php_json"):
         with _lock:
@@ -258,26 +827,79 @@ class Database:
             api_id = f"api-{int(time.time())}"
             new_api = {
                 "id": api_id,
-                "name": name,
-                "url": url,
-                "type": api_type,
+                "name": str(name).strip(),
+                "url": str(url).strip(),
+                "type": str(api_type).strip(),
                 "status": "نشط",
                 "added_at": datetime.now().strftime("%Y-%m-%d %H:%M")
             }
             apis.append(new_api)
             self._save_raw(data)
-            return new_api
+
+            # Verification
+            verified = any(a["id"] == api_id for a in self._load_raw().get("channel_apis", []))
+            if not verified:
+                logger.error("Channel API verification failed: %s", api_id)
+                return False, "فشل حفظ سيرفر API في قاعدة البيانات", {}
+
+        # Auto-sync API channels & categories immediately
+        sync_res = {}
+        clean_type = str(api_type).strip().lower()
+        if clean_type == "m3u":
+            cnt = self.sync_m3u_from_url(url, api_id=api_id)
+            sync_res = {"success": cnt >= 0, "channels_count": max(0, cnt)}
+        else:
+            sync_res = self.sync_php_json(url, api_id=api_id)
+
+        # Get the categories created or associated with this API
+        api_categories = self.get_categories_for_api(api_id)
+        sync_res["categories"] = api_categories
+
+        logger.info("Channel API added and synced: %s (categories: %s, channels: %s)", name, len(api_categories), sync_res.get("channels_count", 0))
+        return True, new_api, sync_res
+
+    def update_channel_api(self, api_id, name=None, url=None, api_type=None):
+        with _lock:
+            data = self._load_raw()
+            apis = data.get("channel_apis", [])
+            target = None
+            for a in apis:
+                if a["id"] == api_id:
+                    if name is not None and str(name).strip(): a["name"] = str(name).strip()
+                    if url is not None and str(url).strip(): a["url"] = str(url).strip()
+                    if api_type is not None and str(api_type).strip(): a["type"] = str(api_type).strip()
+                    target = a
+                    break
+            if not target:
+                return False, "سيرفر API غير موجود"
+
+            self._save_raw(data)
+
+            # Verification
+            verified = any(a["id"] == api_id for a in self._load_raw().get("channel_apis", []))
+            if verified:
+                logger.info("Channel API updated in DB: %s", target)
+                return True, target
+            return False, "فشل حفظ تعديل سيرفر API"
 
     def delete_channel_api(self, api_id):
         with _lock:
             data = self._load_raw()
             apis = data.get("channel_apis", [])
+            initial_len = len(apis)
+            api_name = next((a.get("name", api_id) for a in apis if a["id"] == api_id), api_id)
             data["channel_apis"] = [a for a in apis if a["id"] != api_id]
             self._save_raw(data)
-            return True
+
+            # Verification
+            verified = len(self._load_raw().get("channel_apis", [])) < initial_len
+            if verified:
+                logger.info("Channel API deleted from DB: %s (%s)", api_id, api_name)
+                return True, api_name
+            return False, "سيرفر API غير موجود أو تعذر حذفه"
 
     # ------------------ PHP API JSON Universal Importer ------------------
-    def sync_php_json(self, url_or_raw):
+    def sync_php_json(self, url_or_raw, api_id=None):
         """
         Universal importer for PHP API JSON endpoints and raw JSON data.
         Supports all common PHP IPTV structures:
@@ -301,11 +923,11 @@ class Database:
                     raw_str = response.read().decode("utf-8", errors="ignore")
 
             parsed = json.loads(raw_str)
-            return self._process_parsed_json(parsed)
+            return self._process_parsed_json(parsed, api_id=api_id)
         except Exception as e:
             return {"success": False, "error": str(e), "channels_count": 0, "categories_count": 0}
 
-    def _process_parsed_json(self, parsed):
+    def _process_parsed_json(self, parsed, api_id=None):
         with _lock:
             data = self._load_raw()
             categories = data.setdefault("categories", [])
@@ -322,11 +944,11 @@ class Database:
                 else:
                     cat_name = str(raw_name_or_id).strip()
                     cat_id = cat_name.lower().replace(" ", "_")
-                    # Clean special characters for ID
                     cat_id = re.sub(r'[^a-zA-Z0-9_\u0600-\u06FF]', '', cat_id) or f"cat_{int(time.time())}"
 
                 if cat_name.lower() in name_to_id:
-                    return name_to_id[cat_name.lower()], cat_map.get(name_to_id[cat_name.lower()], cat_name)
+                    c_id = name_to_id[cat_name.lower()]
+                    return c_id, cat_map.get(c_id, cat_name)
                 if cat_id in cat_map:
                     return cat_id, cat_map[cat_id]
 
@@ -339,7 +961,7 @@ class Database:
                 elif "دين" in cat_name or "قرآن" in cat_name or "إسلام" in cat_name: icon = "🕋"
                 elif "أطفال" in cat_name or "كرتون" in cat_name or "kid" in lower_name: icon = "🦁"
 
-                new_cat = {"id": cat_id, "name": cat_name, "icon": icon}
+                new_cat = {"id": cat_id, "name": cat_name, "icon": icon, "api_id": str(api_id or "general")}
                 categories.append(new_cat)
                 cat_map[cat_id] = cat_name
                 name_to_id[cat_name.lower()] = cat_id
@@ -369,7 +991,6 @@ class Database:
                         raw_channel_list = parsed["data"]["channels"]
             # 2. List of items directly
             elif isinstance(parsed, list):
-                # Check if it's a list of category objects containing channels
                 if len(parsed) > 0 and isinstance(parsed[0], dict) and ("channels" in parsed[0] or "items" in parsed[0]):
                     for group in parsed:
                         group_cat = group.get("category") or group.get("category_name") or group.get("name") or "منوعات"
@@ -386,67 +1007,111 @@ class Database:
                 if not isinstance(item, dict):
                     continue
 
-                # Channel Name
-                name = (
+                raw_name = (
                     item.get("name") or item.get("title") or item.get("channel_name")
                     or item.get("stream_name") or item.get("label") or item.get("tvg-name")
                 )
-                if not name:
+                if not raw_name:
                     continue
 
-                # Stream URL
                 url = (
                     item.get("url") or item.get("stream_url") or item.get("link")
                     or item.get("stream") or item.get("play_url") or item.get("source")
                     or item.get("direct_source") or item.get("server_url")
                 )
-                if not url:
-                    # Check in servers list if present
-                    if "servers" in item and isinstance(item["servers"], list) and len(item["servers"]) > 0:
-                        url = item["servers"][0].get("url")
+                if not url and "servers" in item and isinstance(item["servers"], list) and len(item["servers"]) > 0:
+                    url = item["servers"][0].get("url")
                 if not url:
                     continue
 
-                # Category
                 raw_cat = item.get("_forced_category") or item.get("category") or item.get("category_name") or item.get("cat") or item.get("group") or "منوعات"
                 cat_id, cat_name = ensure_category(raw_cat)
 
-                # Logo
                 logo = (
                     item.get("logo") or item.get("icon") or item.get("stream_icon")
                     or item.get("image") or item.get("poster") or "📺"
                 )
 
-                # Quality
-                quality = item.get("quality") or ("4K / FHD" if "4k" in str(name).lower() else "HD")
+                item_qual = item.get("quality", "HD")
+                base_name, detected_quality = self._normalize_name_and_quality(raw_name, item_qual)
+                effective_quality = item_qual if item_qual and item_qual != "HD" else detected_quality
 
-                ch_id = item.get("id") or f"ch-php-{int(time.time())}-{imported_count}"
+                clean_url = str(url).strip()
+                lower_u = clean_url.lower()
+                stream_type = "hls" if (".m3u8" in lower_u or ".php" in lower_u or ".js" in lower_u) else ("mp4" if ".mp4" in lower_u else ("ts" if ".ts" in lower_u else "hls"))
 
-                # Servers
+                referer = item.get("referer") or ""
+                useragent = item.get("useragent") or item.get("agent") or ""
+                if any(k in lower_u for k in ["maziika", "sa037", "sa047", "ostora", "uruk", "optikl"]):
+                    if not referer: referer = "https://www.w2.maziikaaaaa.shop/"
+                    if not useragent: useragent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+
+                # Check if item has embedded servers/qualities
                 if "servers" in item and isinstance(item["servers"], list) and len(item["servers"]) > 0:
                     servers = item["servers"]
+                    for s in servers:
+                        s_u = str(s.get("url", "")).lower()
+                        if any(k in s_u for k in ["maziika", "sa037", "sa047", "ostora", "uruk", "optikl"]):
+                            if not s.get("referer"): s["referer"] = referer or "https://www.w2.maziikaaaaa.shop/"
+                            if not s.get("useragent"): s["useragent"] = useragent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+                        else:
+                            if not s.get("referer") and referer: s["referer"] = referer
+                            if not s.get("useragent") and useragent: s["useragent"] = useragent
                 else:
-                    stream_type = "hls" if ".m3u8" in str(url).lower() else "mp4"
-                    servers = [{"name": "سيرفر البث الرئيسي", "url": str(url).strip(), "type": stream_type}]
+                    servers = [{
+                        "name": f"جودة ({effective_quality})",
+                        "quality": effective_quality,
+                        "url": clean_url,
+                        "type": stream_type,
+                        "referer": referer,
+                        "useragent": useragent
+                    }]
 
+                # Grouping check: Does a channel with this base_name already exist in this category?
+                existing_ch = None
+                for c in channels:
+                    if c.get("category") == cat_id and (c.get("name", "").strip().lower() == base_name.lower() or c.get("url") == clean_url):
+                        existing_ch = c
+                        break
+
+                if existing_ch:
+                    ex_servers = existing_ch.setdefault("servers", [])
+                    for s in servers:
+                        s_url = s.get("url")
+                        if s_url and not any(es.get("url") == s_url for es in ex_servers):
+                            ex_servers.append(s)
+
+                    curr_rank = self.QUAL_RANKS.get(existing_ch.get("quality", "HD").upper(), 3)
+                    new_rank = self.QUAL_RANKS.get(effective_quality.upper(), 3)
+                    if new_rank >= curr_rank:
+                        existing_ch["quality"] = effective_quality
+                        existing_ch["url"] = clean_url
+                        existing_ch["streamUrl"] = clean_url
+                    imported_count += 1
+                    continue
+
+                ch_id = item.get("id") or f"ch-php-{int(time.time())}-{imported_count}"
                 new_ch = {
                     "id": str(ch_id),
-                    "name": str(name).strip(),
+                    "name": base_name,
                     "category": cat_id,
                     "categoryName": cat_name,
+                    "api_id": str(api_id or "general"),
                     "currentShow": item.get("currentShow") or item.get("epg") or "بث مباشر عبر الإنترنت",
                     "logo": logo,
-                    "quality": quality,
+                    "quality": effective_quality,
+                    "url": clean_url,
+                    "streamUrl": clean_url,
+                    "referer": referer,
+                    "useragent": useragent,
+                    "origin": item.get("origin") or "",
+                    "cookie": item.get("cookie") or "",
+                    "key": item.get("key") or "",
+                    "scheme": item.get("scheme") or "",
                     "badge": "مباشر",
                     "servers": servers
                 }
-
-                # Avoid exact duplicate channel ID
-                existing_idx = next((i for i, c in enumerate(channels) if c["id"] == new_ch["id"]), None)
-                if existing_idx is not None:
-                    channels[existing_idx] = new_ch
-                else:
-                    channels.append(new_ch)
+                channels.append(new_ch)
                 imported_count += 1
 
             self._save_raw(data)
@@ -458,8 +1123,8 @@ class Database:
             }
 
     # ------------------ M3U Importer ------------------
-    def sync_m3u_from_url(self, url, category="sports", category_name="رياضة"):
-        """Fetch and parse M3U playlist and add discovered channels to database."""
+    def sync_m3u_from_url(self, url, category="sports", category_name="قنوات رياضية", api_id=None):
+        """Fetch and parse M3U playlist and add discovered channels to database with smart quality grouping."""
         try:
             req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=12) as response:
@@ -490,28 +1155,21 @@ class Database:
 
                 elif not line.startswith("#") and (line.startswith("http://") or line.startswith("https://")):
                     if current_name:
-                        self.add_category(current_cat, current_cat_name)
-                        ch_id = f"m3u-{int(time.time())}-{imported_count}"
-                        ch_data = {
-                            "id": ch_id,
-                            "name": current_name,
-                            "category": current_cat,
-                            "categoryName": current_cat_name,
-                            "currentShow": "بث مباشر عبر الإنترنت",
-                            "logo": current_logo,
-                            "quality": "HD",
-                            "badge": "مباشر",
-                            "servers": [
-                                {"name": "سيرفر البث", "url": line, "type": "hls" if ".m3u8" in line else "mp4"}
-                            ]
-                        }
-                        self.add_channel(ch_data)
+                        self.add_single_channel(
+                            name=current_name,
+                            url=line,
+                            category_id=current_cat,
+                            category_name=current_cat_name,
+                            logo=current_logo,
+                            api_id=api_id or "general"
+                        )
                         imported_count += 1
                         current_name = ""
-                        if imported_count >= 150:
+                        if imported_count >= 250:
                             break
             return imported_count
-        except Exception:
+        except Exception as e:
+            logger.error("sync_m3u_from_url error: %s", e)
             return -1
 
     def _parse_m3u_text(self, content, default_cat="sports", default_cat_name="قنوات رياضية"):
@@ -684,20 +1342,29 @@ class Database:
             data = self._load_raw()
             return data.get("maintenance", {
                 "enabled": False,
-                "message": "التطبيق يخضع لصيانة دورية، سنعود قريباً!",
+                "message": "التطبيق تحت الصيانة حالياً، نعمل على تحسين تجربتك. يرجى المحاولة لاحقاً",
                 "updated_at": ""
             })
 
-    def set_maintenance(self, enabled: bool, message=None):
+    def set_maintenance(self, enabled: bool, message=None, admin_id=None):
         with _lock:
             data = self._load_raw()
             m = data.setdefault("maintenance", {})
             m["enabled"] = bool(enabled)
-            if message:
+            if message and str(message).strip():
                 m["message"] = str(message).strip()
+            elif not m.get("message") or not m["message"].strip():
+                m["message"] = "التطبيق تحت الصيانة حالياً، نعمل على تحسين تجربتك. يرجى المحاولة لاحقاً"
             m["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._save_raw(data)
-            return m
+
+            # Verification: Re-read directly from disk
+            saved_m = self._load_raw().get("maintenance", {})
+            if saved_m.get("enabled") == bool(enabled):
+                logger.info("Maintenance state updated to %s (message: %s) by admin %s", enabled, m.get("message"), admin_id)
+                return True, saved_m
+            logger.error("Maintenance persistence verification failed for admin %s", admin_id)
+            return False, "فشل حفظ حالة الصيانة في قاعدة البيانات"
 
     # ------------------ App Update ------------------
     def get_app_update(self):
@@ -725,7 +1392,7 @@ class Database:
             up["is_force"] = bool(is_force)
             up["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._save_raw(data)
-            return up
+            return True, up
 
     def toggle_app_update(self, enabled: bool):
         with _lock:
@@ -743,18 +1410,28 @@ class Database:
             return data.get("admins", {})
 
     def is_admin(self, user_id):
-        if ADMIN_ID and user_id == ADMIN_ID:
+        try:
+            uid_int = int(user_id)
+        except (ValueError, TypeError):
+            uid_int = 0
+        if ADMIN_ID and uid_int == ADMIN_ID:
             return True
         with _lock:
             data = self._load_raw()
-            return str(user_id) in data.get("admins", {})
+            admins = data.get("admins", {})
+            return str(user_id) in admins or (uid_int and str(uid_int) in admins)
 
     def has_permission(self, user_id, permission):
-        if ADMIN_ID and user_id == ADMIN_ID:
+        try:
+            uid_int = int(user_id)
+        except (ValueError, TypeError):
+            uid_int = 0
+        if ADMIN_ID and uid_int == ADMIN_ID:
             return True
         with _lock:
             data = self._load_raw()
-            admin = data.get("admins", {}).get(str(user_id))
+            admins = data.get("admins", {})
+            admin = admins.get(str(user_id)) or admins.get(str(uid_int))
             if not admin:
                 return False
             perms = admin.get("permissions", [])
