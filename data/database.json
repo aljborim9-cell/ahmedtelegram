@@ -1,0 +1,71 @@
+{
+  "categories": [
+    {
+      "id": "sports",
+      "name": "قنوات رياضية",
+      "icon": "⚽"
+    }
+  ],
+  "channels": [
+    {
+      "id": "ch-1793551557-1",
+      "name": "سبورت 1",
+      "category": "sports",
+      "categoryName": "قنوات رياضية",
+      "currentShow": "بث مباشر حصري عبر الإنترنت",
+      "logo": "⚽",
+      "quality": "FHD",
+      "url": "https://uruk.optikl.ink/ostora/main.php?id=116900&cat=4524",
+      "streamUrl": "https://uruk.optikl.ink/ostora/main.php?id=116900&cat=4524",
+      "referer": "https://www.w2.maziikaaaaa.shop/",
+      "useragent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+      "origin": "",
+      "cookie": "",
+      "key": "",
+      "scheme": "",
+      "badge": "مباشر",
+      "servers": [
+        {
+          "name": "سيرفر البث (FHD)",
+          "url": "https://uruk.optikl.ink/ostora/main.php?id=116900&cat=4524",
+          "type": "hls"
+        }
+      ]
+    }
+  ],
+  "channel_apis": [
+    {
+      "id": "api-default",
+      "name": "سيرفر البث الافتراضي (M3U)",
+      "url": "https://iptv-org.github.io/iptv/languages/ara.m3u",
+      "type": "m3u",
+      "status": "جاهز",
+      "added_at": "2026-10-31 22:37"
+    }
+  ],
+  "maintenance": {
+    "enabled": false,
+    "message": "صيانة تجريبية لاختبار النظام",
+    "updated_at": "2026-10-31 22:51:03"
+  },
+  "app_update": {
+    "enabled": false,
+    "version_code": 3,
+    "version_name": "2.0.0",
+    "download_url": "http://example.com/app.apk",
+    "release_notes": "ميزات جديدة",
+    "is_force": false,
+    "updated_at": "2026-10-31 22:51:03"
+  },
+  "admins": {
+    "6803988521": {
+      "id": 6803988521,
+      "name": "المدير العام (Super Admin)",
+      "role": "super_admin",
+      "permissions": [
+        "all"
+      ],
+      "added_at": "2026-11-01 00:29"
+    }
+  }
+}
